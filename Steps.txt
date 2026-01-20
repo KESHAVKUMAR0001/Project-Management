@@ -1,0 +1,5 @@
+Steps in making project - Project Management Platform
+
+1. Setting up the project
+    i. Initialise node inside project
+    
