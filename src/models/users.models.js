@@ -83,4 +83,45 @@ userSchema.methods.isPasswordCorrect=async function(password){
 }
 
 //Attach methods to schema: To generate access token
+userSchema.methods.generateAccessToken=function(){
+    return jwt.sign(                   //To create any JWT: jwt.sign({fields that you want in payload of JWT},secret,expiryOfToken)
+        {
+            _id:this._id,               //id is default field created by mongoDB
+            username:this.username,     //This id inside token is used later for verification of user
+            email:this.email
+        },
+        process.env.ACCESS_TOKEN_SECRET,
+        {expiresIn:process.env.ACCESS_TOKEN_EXPIRY}
+    )
+}
+
+//Attach methods to schema: TO generate refresh token
+userSchema.methods.generateRefreshToken=function(){
+    return jwt.sign({
+        _id:this._id,           //Refresh token has lesser payload
+    },
+    process.env.REFRESH_TOKEN_SECRET,
+    {expiresIn:process.env.REFRESH_TOKEN_EXPIRY}
+)
+}
+
+//Attach methods to schema: To create tokenWithoutData using crypto module of nodeJS
+userSchema.methods.generateTemporaryToken=function(){
+    const unHashedToken=crypto.randomBytes(20).toString("hex")      //Binary data to hexadecimal format
+
+    //Use crypto module to Hash token
+    const hashedToken=crypto
+    .createHash("sha256")           //Algo for hashing
+    .update(unHashedToken)          //String to be hashed
+    .digest("hex")                  
+
+    const tokenExpiry=Date.now()+(20*60*1000)  //20 mins
+    return {unHashedToken,hashedToken,tokenExpiry}
+}
+
+//Schema is just a design. To connect schema to actual database and perform CRUD operations, you need to convert it to DB model
+//To convert schema to DB model, use mongoose.model(modelName,Schema), exporting it so that we can utilise wherever we want to
 export const User=mongoose.model("User",userSchema)
+//We can import this user anywhere to query anything from DB
+//All functionalities attached to schema can be used by every entry of DB only, not by DB model
+//Whenever you need to run query on entire DB, use User(like User.find()). When u need to run only on a particular instance of DB, use user(like user.save())
