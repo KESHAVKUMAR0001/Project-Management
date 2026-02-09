@@ -197,13 +197,262 @@ const getCurrentUser=asyncHandler(async (req,res)=>{
 })
 
 
+//Function to verify email
+const verifyEmail=asyncHandler(async (req,res)=>{
+
+    //1. Take the verification token from URL (in req.params that contains url parameters)
+    const verificationToken=req.params.verificationToken      
+    //Verification Token must be present in URL or route as parameter
+
+    if(!verificationToken){
+        throw new ApiError(
+            400,
+            "Email verification token is missing"
+        )
+    }
+
+    //2. Convert that unhashed token to hashed token and match it with emailVerificationToken stored in DB with greater emailVerificationExpiry
+    //While registering user, we sent a dynamic link containing unhashed token 
+    //and stored emailVerificationToken (or hashed token) and emailVerificationExpiry in DB)
+    let hashedToken=crypto
+    .createHash("sha256")
+    .update(verificationToken)
+    .digest("hex")
+
+    const user=await User.findOne({
+        emailVerificationToken:hashedToken,
+        emailVerificationExpiry:{$gt:Date.now()}    //emailVErificationToken must have greater emailVerificationExpiry
+    })
+
+    if(!user){
+        throw new ApiError(401,"User verification has been failed")
+    }
+
+    //3. If token is matched and not expired, mark isEmailVerified flag as true,clear token and save user
+    user.emailVerificationToken=undefined
+    user.emailVerificationExpiry=undefined      //st data is not stored in DB unnecessary
+    
+    user.isEmailVerified=true
+    await user.save({validateBeforeSave:false})
+
+    //4. Send response 
+    return res
+    .status(200)
+    .json(
+        new ApiResponse(200,{isEmailVerified:true},"User verification has been successful")
+    )
+})
+
+
+//Function to resend Email verification
+//Email verification can be present only if email is not verified and after emailVerficationExpiry
+//Apply these 2 checks then repeat same 4&5 step of registerUser: Attach UT,HT and tokenExpiry then send Email
+const resendEmailVerification=asyncHandler(async (req,res)=>{
+    const user=req.user
+    //Verification email should not be resent if user is already verified
+    if(user.isEmailVerified){
+        throw new ApiError(409,"Email already verified")
+    }
+
+    //Verification email should be resent only after emailVerificationExpiry
+    if(user.emailVerificationExpiry &&
+    user.emailVerificationExpiry>Date.now()){
+        throw new ApiError(408,"Verification email already sent. Please wait sometime before resending")
+    }
+
+    //Repeat 4th and 5th step of registerUser: Attact UT,HT and tokenExpiry and sendEmail
+    //4. Saving user in DB with UT,HT and tokenExpiry
+    const {unHashedToken,hashedToken,tokenExpiry}=user.generateTemporaryToken()
+
+    user.emailVerificationToken=hashedToken
+    user.emailVerificationExpiry=tokenExpiry
+    await user.save({validateBeforeSave:false})
+
+    //5. Verify user by Email
+    await sendEmail(
+        {
+            email:user?.email,
+            subject:"Please verify your email",
+            mailgenContent:emailVerificationMailgenContent(user.username, 
+            `${req.protocol}://${req.get("host")}/api/v1/users/verify-email/${unHashedToken}`)
+        }
+    )
+
+    return res
+    .status(200)
+    .json(new ApiResponse(200,{},"Verification email has been resent successfully"))
+})
+
+
+//Function to refresh the access token
+//Since refreshToken is used to refresh the accessToken: fetch incoming refreshToken, decode and verify it with refreshToken stored in DB, then generate new accessToken and refreshToken
+const refreshAccessToken=asyncHandler(async (req,res)=>{
+    //1. Fetch incoming refreshToken through cookies or body
+    const incomingRefreshToken=req.cookies.refreshToken||req.body.refreshToken
+    
+    if(!incomingRefreshToken){
+        throw new ApiError(401,"Unauthorized Access")
+    }
+
+    //2. Decode to find user(using jwt.verify()) and verify it with refreshToken of user stored in DB (coz we need to extract user from DB from id stored in refreshToken)
+    try {
+        //Since its token with data,thats why needed to decode then match
+        const decodedToken=jwt.verify(incomingRefreshToken,process.env.REFRESH_TOKEN_SECRET)
+
+        const user=await User.findById(decodedToken._id)
+        if(!user){
+            throw new ApiError(407,"Invalid Refresh Token")
+        }
+
+        if(incomingRefreshToken!==user.refreshToken){
+            throw new ApiError(403,"Refresh token has expired")
+        }
+
+    //3. Generate new accessToken and refreshToken. Send both to user as cookie and save refreshToken in DB
+    const {accessToken,refreshToken}= await generateAccessAndRefreshToken(user._id)
+    //Saving new refresh Token in database
+    user.refreshToken=refreshToken
+    await user.save({validateBeforeSave:false})
+
+    //Sending both to user as cookie
+    const options={
+        httpOnly:true,
+        secure:true
+    }
+
+    return res
+    .status(200)
+    .cookie("accessToken",accessToken,options)
+    .cookie("refreshToken",refreshToken,options)
+    .json(
+        new ApiResponse(
+            200,
+            {accessToken,refreshToken},
+            "Access token has been refreshed successfully"
+        )
+    )
+    } catch (error) {
+        console.log(error)
+        throw new ApiError(401,"Invalid Refresh Token")
+    }
+
+})
+
+
+//Function to handle forgotPassword Request
+//In forgotPassword mechanism: client sends his email address, server checks if email exists in DB, then sends email to that email address that leads to reset password mechanism
+//Take email address of client, verify if it exists in DB and repeat 4th&5th step of registerUser: Attach UT,HT and tokenExpiry then send Email
+const forgotPasswordRequest=asyncHandler(async (req,res)=>{
+    //1. Take email address of client
+    const {email}=req.body
+
+    //2. verify if it exists in DB
+    const user=await User.findOne({email})
+    if(!user){
+        throw new ApiError(404,"User does not exist")
+    }
+
+    //3. Repeat 4th&5th step of registerUser: Attach UT,HT and tokenExpiry then send Email
+    const {unHashedToken,hashedToken,tokenExpiry}=user.generateTemporaryToken()
+    //Save hashedToken and tokenExpiry in DB and send unhashedToken in email (same mechanism)
+    user.forgotPasswordToken=hashedToken
+    user.forgotPasswordExpiry=tokenExpiry
+    await user.save({validateBeforeSave:false})
+
+    await sendEmail(
+        {
+            email:user?.email,
+            subject:"Click on this link to reset your password",
+            mailgenContent:forgotPasswordMailgenContent(user.username, 
+            `${process.env.FORGOT_PASSWORD_REDIRECT_URL}/${unHashedToken}`)     //We can use dynamic link or static link both
+        }
+    )
+    
+    return res
+    .status(200)
+    .json(
+        new ApiResponse(200,{},"Email to reset password sent successfully")
+    )
+})
+
+
+//Function to reset Forgot Password
+//Take resetToken and newPassword from request, verify resetToken and update password of user
+const resetForgotPassword=asyncHandler(async (req,res) => {
+    //1. Take resetToken and newPassword from request
+    const {resetToken}=req.params       //Reset token must be present as parameter in url(or route)
+    const {newPassword}=req.body
+    const {confirmPassword}=req.body
+
+    //2. Verify resetToken (resetToken is unHashed token, so hash it then match it with one stored in DB)
+    let hashedToken=crypto
+    .createHash("sha256")
+    .update(resetToken)
+    .digest("hex")
+
+    //Same DB query method to find matching user in DB (req.user will fail here because user is not loggedIn and does not have accessToken)
+    //Since resetToken is tokenWithoutData, no need to decode, Directly match
+    const user=await User.findOne({forgotPasswordToken:hashedToken,
+        forgotPasswordExpiry:{$gt: Date.now()}
+    })
+    if(!user){
+        throw new ApiError(404,"Invalid Reset Token")
+    }
+
+    if(newPassword!==confirmPassword){
+        throw new ApiError(408,"PAsswords dont match")
+    }
+
+    //3. Update Password of user and clear DB
+    user.password=newPassword
+    await user.save({validateBeforeSave:false})
+
+    user.forgotPasswordExpiry=undefined
+    user.forgotPasswordToken=undefined
+
+    return res
+    .status(200)
+    .json(
+        new ApiResponse(200,{},"Password has been reset successfully")
+    )
+})
+
+
+//Function to change Password (For user who is already loggedIn)
+//req.user works only when user is loggedIn otherwise you need to run a query in DB to find matching user
+//Take old and new password, verify old password and change to new password
+const changeCurrentPassword=asyncHandler(async (req,res) => {
+    //1. Take old and new password (from req.body)
+    const {oldPassword,newPassword}=req.body
+    const user=await User.findById(req.user?._id)
+
+    //2. Verify old password (By using method attached to model)
+    const isPasswordValid=await user.isPasswordCorrect(oldPassword)
+
+    if(!isPasswordValid){
+        throw new ApiError(408,"Invalid Old Password")
+    }
+
+    //3. Change to new password and save
+    user.password=newPassword
+    await user.save({validateBeforeSave:false})
+
+    return res
+    .status(200)
+    .json(
+        new ApiResponse(200,{},"Password changed successfully")
+    )
+})
+
 export {
     registerUser,
     loginUser,
     logoutUser,
     getCurrentUser,
-    registerUser,
-    loginUser,
-    logoutUser,
-    getCurrentUser
-}
+    verifyEmail,
+    resendEmailVerification,
+    refreshAccessToken,
+    forgotPasswordRequest,
+    resetForgotPassword,
+    changeCurrentPassword
+}       
